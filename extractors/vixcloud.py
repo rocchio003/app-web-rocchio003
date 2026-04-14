@@ -94,6 +94,34 @@ class VixCloudExtractor:
         if "window.masterPlaylist" not in search_text and "'token':" not in search_text and '"token":' not in search_text:
             return None
 
+        master_playlist_match = re.search(
+            r"window\.masterPlaylist\s*=\s*\{.*?params\s*:\s*\{(?P<params>.*?)\}\s*,\s*url\s*:\s*['\"](?P<url>[^'\"]+)['\"]",
+            search_text,
+            re.DOTALL,
+        )
+        if master_playlist_match:
+            params_block = master_playlist_match.group("params")
+            url = master_playlist_match.group("url").replace("\\/", "/")
+            token_match = re.search(
+                r"['\"]token['\"]\s*:\s*['\"](?P<token>[^'\"]+)['\"]",
+                params_block,
+            )
+            expires_match = re.search(
+                r"['\"]expires['\"]\s*:\s*['\"](?P<expires>\d+)['\"]",
+                params_block,
+            )
+            asn_match = re.search(
+                r"['\"]asn['\"]\s*:\s*['\"](?P<asn>[^'\"]*)['\"]",
+                params_block,
+            )
+            if token_match and expires_match:
+                return (
+                    url,
+                    token_match.group("token"),
+                    expires_match.group("expires"),
+                    asn_match.group("asn") if asn_match else None,
+                )
+
         playlist_url_match = re.search(
             r"window\.masterPlaylist[\s\S]*?url\s*:\s*['\"](?P<url>[^'\"]+)['\"]",
             search_text,
@@ -170,6 +198,16 @@ class VixCloudExtractor:
             return None
         parsed = urlparse(url)
         return f"{parsed.scheme}://{parsed.netloc}/playlist/{match.group('video_id')}?b=1"
+
+    @staticmethod
+    def _append_playlist_params(
+        playlist_url: str, token: str, expires: str, asn: str | None = None
+    ) -> str:
+        separator = "&" if "?" in playlist_url else "?"
+        final_url = f"{playlist_url}{separator}token={token}&expires={expires}"
+        if asn:
+            final_url += f"&asn={asn}"
+        return final_url
 
     async def _fetch_html_via_browser(
         self, url: str, request_headers: dict | None = None
@@ -310,6 +348,10 @@ class VixCloudExtractor:
         asn_from_input = input_query.get("asn", [None])[0]
 
         if components is None:
+            if response.status == 200:
+                raise ExtractorError(
+                    "VixCloud extraction failed: embed page loaded but masterPlaylist token was not found"
+                )
             if token_from_input and expires_from_input:
                 playlist_url = self._build_embed_playlist_url(url)
                 if playlist_url:
@@ -337,13 +379,7 @@ class VixCloudExtractor:
                 "VixCloud extraction failed: missing token/expires in both page and input URL"
             )
 
-        separator = "&" if "?" in playlist_url else "?"
-        final_url = (
-            f"{playlist_url}{separator}token={token}"
-            f"&expires={expires}"
-        )
-        if asn:
-            final_url += f"&asn={asn}"
+        final_url = self._append_playlist_params(playlist_url, token, expires, asn)
 
         if "window.canPlayFHD = true" in html and "canPlayFHD=1" not in final_url:
             final_url += "&h=1"
