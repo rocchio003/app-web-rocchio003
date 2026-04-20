@@ -346,6 +346,9 @@ class HLSProxy:
         self.latest_version = "Checking..."
         self.warp_status = "Disabled" if not ENABLE_WARP else "Checking..."
 
+        # Track dynamically bypassed domains for WARP (TUN mode)
+        self.bypassed_warp_domains = set()
+
     async def start_tasks(self):
         """Starts background tasks for the proxy."""
         asyncio.create_task(self._update_latest_version())
@@ -357,7 +360,7 @@ class HLSProxy:
         while True:
             try:
                 # We use the internal session to check the actual connection state
-                session = await self._get_session()
+                session = await self._get_session(url=key_url if 'key_url' in locals() else (stream_url if 'stream_url' in locals() else (url if 'url' in locals() else None)))
                 async with session.get("https://www.cloudflare.com/cdn-cgi/trace", timeout=5) as resp:
                     if resp.status == 200:
                         text = await resp.text()
@@ -492,7 +495,9 @@ class HLSProxy:
 
         return ts, nonce, fingerprint, key_path
 
-    async def _get_session(self, prefer_default_family: bool = False):
+    async def _get_session(self, prefer_default_family: bool = False, url: str = None):
+        if url:
+            self._check_dynamic_warp_bypass(url)
         target_attr = "flex_session" if prefer_default_family else "session"
         session = getattr(self, target_attr)
         if session is None or session.closed:
@@ -512,6 +517,33 @@ class HLSProxy:
             setattr(self, target_attr, session)
         return session
 
+    def _check_dynamic_warp_bypass(self, url: str):
+        """Dynamically adds domain to WARP bypass if it matches known patterns."""
+        if not ENABLE_WARP or VERSION_MODE != "Full":
+            return
+            
+        # Patterns for domains that usually block Cloudflare/WARP
+        # Vavoo, Mediahubmx, Cinemacity, VixSrc, etc.
+        bypass_patterns = [
+            "vavoo.to", "vcdn.io", "host-cdn.net", "ngolpdkyoctjcddxshli469r.org",
+            "citysync.club", "cccdn.net", "cinemacity.cc", "vixsrc.to", "vixcloud.co"
+        ]
+        
+        try:
+            from urllib.parse import urlsplit
+            domain = urlsplit(url).netloc
+            if not domain: return
+            
+            # If domain matches any pattern and hasn't been bypassed yet
+            if any(p in domain.lower() for p in bypass_patterns):
+                if domain not in self.bypassed_warp_domains:
+                    logging.info(f"⚡ [Dynamic Bypass] Adding {domain} to WARP exclusion list...")
+                    # Add to WARP bypass (works in TUN mode)
+                    os.system(f"warp-cli --accept-tos tunnel host add {domain} > /dev/null 2>&1")
+                    self.bypassed_warp_domains.add(domain)
+        except Exception as e:
+            logging.error(f"❌ Error in dynamic WARP bypass: {e}")
+
     async def _get_proxy_session(self, url: str):
         """Get a session with proxy support for the given URL.
 
@@ -521,6 +553,9 @@ class HLSProxy:
         - session: The aiohttp ClientSession to use
         - proxy_url: The proxy URL being used, or None for direct connection
         """
+        # Trigger dynamic bypass check before getting proxy settings
+        self._check_dynamic_warp_bypass(url)
+        
         proxy = get_proxy_for_url(url, TRANSPORT_ROUTES, GLOBAL_PROXIES)
 
         prefer_default_family = "ai.the-sunmoon.site/key/" in url
@@ -1965,7 +2000,7 @@ class HLSProxy:
             # ✅ Use pooled session for better performance
             # The session already has the proxy configured in its connector
             if self._should_force_direct_from_query(request):
-                session = await self._get_session()
+                session = await self._get_session(url=key_url if 'key_url' in locals() else (stream_url if 'stream_url' in locals() else (url if 'url' in locals() else None)))
                 proxy_used = None
                 logger.info("Using direct session for AES key request (forced)")
             else:
@@ -2221,7 +2256,7 @@ class HLSProxy:
 
             # ✅ Use pooled session for better performance
             if self._should_force_direct_from_query(request):
-                session = await self._get_session()
+                session = await self._get_session(url=key_url if 'key_url' in locals() else (stream_url if 'stream_url' in locals() else (url if 'url' in locals() else None)))
                 session_proxy = None
                 logger.info(
                     f"[Proxy Stream] Using direct session (forced) for: {stream_url}"
@@ -3151,7 +3186,10 @@ class HLSProxy:
             if decrypt_segment is None:
                 return
 
-            session = await self._get_session()
+            # Ensure dynamic WARP bypass for prefetch
+            self._check_dynamic_warp_bypass(url)
+            
+            session = await self._get_session(url=url)
 
             # Download Init (usa cache se possibile)
             init_content = b""
