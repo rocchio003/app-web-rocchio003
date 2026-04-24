@@ -398,6 +398,7 @@ class DLStreamsExtractor:
                         nonlocal manifest_text, captured_stream_url
                         try:
                             response_url = str(response.url)
+                            content_type = (response.headers.get("content-type") or "").lower()
                             # Catch any EXTM3U manifest from a proxy-style URL
                             is_manifest_candidate = "/proxy/" in response_url and channel_key in response_url
                             
