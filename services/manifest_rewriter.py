@@ -379,6 +379,8 @@ class ManifestRewriter:
 
                     if api_password:
                         proxy_key_url += f"&api_password={api_password}"
+                    if bypass_warp:
+                        proxy_key_url += "&warp=off"
 
                     new_line = line[:uri_start] + proxy_key_url + line[uri_end:]
                     rewritten_lines.append(new_line)
@@ -449,6 +451,8 @@ class ManifestRewriter:
                     proxy_key_url += header_params
                     if api_password:
                         proxy_key_url += f"&api_password={api_password}"
+                    if bypass_warp:
+                        proxy_key_url += "&warp=off"
 
                     new_line = line[:uri_start] + proxy_key_url + line[uri_end:]
                     rewritten_lines.append(new_line)

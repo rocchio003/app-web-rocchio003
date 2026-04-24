@@ -2097,7 +2097,10 @@ class HLSProxy:
             logger.info(f"🔐 Proxying License Request to: {license_url}")
 
             # ✅ Use pooled session for better performance
-            session, _ = await self._get_proxy_session(license_url)
+            bypass_warp = request.query.get("warp", "").lower() == "off"
+            session, _ = await self._get_proxy_session(
+                license_url, bypass_warp=bypass_warp
+            )
             async with session.request(
                 request.method, license_url, headers=headers, data=body
             ) as resp:
@@ -2127,6 +2130,8 @@ class HLSProxy:
         """✅ NUOVO: Gestisce richieste per chiavi AES-128"""
         if not check_password(request):
             return web.Response(status=401, text="Unauthorized: Invalid API Password")
+
+        bypass_warp = request.query.get("warp", "").lower() == "off"
 
         # 1. Gestione chiave statica (da MPD converter)
         static_key = request.query.get("static_key")
@@ -2251,7 +2256,9 @@ class HLSProxy:
                 proxy_used = None
                 logger.debug("Using direct session for AES key request (forced)")
             else:
-                session, proxy_used = await self._get_proxy_session(key_url)
+                session, proxy_used = await self._get_proxy_session(
+                    key_url, bypass_warp=bypass_warp
+                )
                 if proxy_used:
                     logger.debug(f"Using pooled session with proxy: {proxy_used}")
             secret_key = headers.pop("X-Secret-Key", None)
@@ -2413,7 +2420,10 @@ class HLSProxy:
                 headers["Accept-Encoding"] = "identity"
 
             # ✅ Use pooled session for better performance
-            session, _ = await self._get_proxy_session(segment_url)
+            bypass_warp = request.query.get("warp", "").lower() == "off"
+            session, _ = await self._get_proxy_session(
+                segment_url, bypass_warp=bypass_warp
+            )
             # ✅ Use yarl.URL with encoded=True to prevent double-encoding of commas
             final_segment_url = yarl.URL(segment_url, encoded=True)
             async with session.get(final_segment_url, headers=headers) as resp:
@@ -3553,7 +3563,9 @@ class HLSProxy:
 
         return web.json_response(spec)
 
-    def _prefetch_next_segments(self, current_url, init_url, key, key_id, headers):
+    def _prefetch_next_segments(
+        self, current_url, init_url, key, key_id, headers, bypass_warp: bool = False
+    ):
         """Identifica i prossimi segmenti e avvia il download in background."""
         try:
             parsed = urllib.parse.urlparse(current_url)
@@ -3588,7 +3600,13 @@ class HLSProxy:
                     self.prefetch_tasks.add(cache_key)
                     asyncio.create_task(
                         self._fetch_and_cache_segment(
-                            next_url, init_url, key, key_id, headers, cache_key
+                            next_url,
+                            init_url,
+                            key,
+                            key_id,
+                            headers,
+                            cache_key,
+                            bypass_warp=bypass_warp,
                         )
                     )
 
@@ -3596,7 +3614,7 @@ class HLSProxy:
             logger.warning(f"⚠️ Prefetch error: {e}")
 
     async def _fetch_and_cache_segment(
-        self, url, init_url, key, key_id, headers, cache_key
+        self, url, init_url, key, key_id, headers, cache_key, bypass_warp: bool = False
     ):
         """Scarica, decripta e mette in cache un segmento in background."""
         try:
@@ -3606,7 +3624,7 @@ class HLSProxy:
             # Ensure dynamic WARP bypass for prefetch
             self._check_dynamic_warp_bypass(url)
             
-            session = await self._get_session(url=url)
+            session, _ = await self._get_proxy_session(url, bypass_warp=bypass_warp)
 
             # Download Init (usa cache se possibile)
             init_content = b""
@@ -3753,7 +3771,10 @@ class HLSProxy:
                     headers[header_name] = param_value
 
             # Get proxy-enabled session for segment fetches
-            segment_session, segment_proxy = await self._get_proxy_session(url)
+            bypass_warp = request.query.get("warp", "").lower() == "off"
+            segment_session, segment_proxy = await self._get_proxy_session(
+                url, bypass_warp=bypass_warp
+            )
             if segment_proxy:
                 logger.info(f"📡 [Decrypt] Using session via proxy: {segment_proxy}")
 
@@ -3862,7 +3883,9 @@ class HLSProxy:
                     del self.segment_cache[k]
 
             # Prefetch next segments in background
-            self._prefetch_next_segments(url, init_url, key, key_id, headers)
+            self._prefetch_next_segments(
+                url, init_url, key, key_id, headers, bypass_warp=bypass_warp
+            )
 
             # Invia Risposta
             return web.Response(
