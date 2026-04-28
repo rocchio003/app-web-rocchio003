@@ -39,7 +39,18 @@ class BaseExtractor:
             extractor_name,
             [
                 "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/all/data.txt",
-                "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text"
+                "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text",
+                "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
+                "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks4.txt",
+                "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
+                "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+                "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
+                "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies.txt",
+                "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+                "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt",
+                "https://raw.githubusercontent.com/mmpx12/proxy-list/master/https.txt",
+                "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks4.txt",
+                "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks5.txt"
             ]
         )
 
@@ -82,6 +93,16 @@ class BaseExtractor:
                 session = await self._get_session(url)
                 async with session.request(method, url, headers=final_headers, allow_redirects=True, **kwargs) as response:
                     response.raise_for_status()
+                    
+                    # ✅ NUOVO: Protezione contro file binari giganti
+                    content_type = response.headers.get("Content-Type", "").lower()
+                    content_length = int(response.headers.get("Content-Length", 0))
+                    
+                    if "video/" in content_type or "audio/" in content_type or content_length > 2 * 1024 * 1024:
+                        logger.warning(f"[{self.extractor_name}] Skipping text read for binary/large content: {content_type} ({content_length} bytes)")
+                        # Restituisci un MockResponse "vuoto" o che indica il bypass
+                        return MockResponse("", response.status, response.headers, str(response.url), response.cookies)
+
                     content = await response.text()
                     
                     class MockResponse:
