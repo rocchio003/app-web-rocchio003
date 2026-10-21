@@ -477,6 +477,8 @@ class MPDToHLSConverter:
         lines = ['#EXTM3U', '#EXT-X-VERSION:6']
         if not is_live:
             lines.append('#EXT-X-PLAYLIST-TYPE:VOD')
+        else:
+            lines.append('#EXT-X-START:TIME-OFFSET=-18.0')
         lines.append(f'#EXT-X-TARGETDURATION:{max(1, int(max(durations)) + 1)}')
         lines.append('#EXT-X-MEDIA-SEQUENCE:0')
 
@@ -568,7 +570,12 @@ class MPDToHLSConverter:
             # fMP4 richiede HLS versione 6 o 7, ma per .ts output usiamo v3 per compatibilità
             # Per LIVE: non usare VOD e non aggiungere ENDLIST
             if is_live:
-                lines = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-INDEPENDENT-SEGMENTS']
+                lines = [
+                    '#EXTM3U',
+                    '#EXT-X-VERSION:3',
+                    '#EXT-X-INDEPENDENT-SEGMENTS',
+                    '#EXT-X-START:TIME-OFFSET=-18.0',
+                ]
             else:
                 # Target duration is emitted once below from the actual segment
                 # durations.  A duplicate tag makes some HLS.js versions treat
@@ -607,7 +614,7 @@ class MPDToHLSConverter:
                     if is_null_key:
                         # Chiave nulla: usa comunque l'endpoint decrypt per il remux a TS
                         # ma aggiungi flag per saltare la decrittazione vera e propria
-                        logger.debug(f"🔓 Null key detected - using remux endpoint without decryption")
+                        logger.debug("🔓 Null key detected - using remux endpoint without decryption")
                         server_side_decryption = True
                         drm_token = next(
                             (
@@ -648,7 +655,7 @@ class MPDToHLSConverter:
                  ext_param = "ts"
             
             if ext_param == "ts" and not server_side_decryption:
-                 logger.debug(f"🔄 Concatenation requested (ext=ts)")
+                 logger.debug("🔄 Concatenation requested (ext=ts)")
                  server_side_decryption = True
                  # Use dummy key/id to satisfy the endpoint requirement, and set skip_decrypt=1
                  decryption_params = "&key=00000000000000000000000000000000&key_id=00000000000000000000000000000000&skip_decrypt=1"
@@ -837,7 +844,6 @@ class MPDToHLSConverter:
                         if not segments_to_use:
                             segments_to_use = [all_segments[-1]]
 
-                        total_duration = sum(seg['duration'] for seg in segments_to_use)
                         max_duration = max(seg['duration'] for seg in segments_to_use)
                         if segments_to_use:
                             if has_explicit_start_number:

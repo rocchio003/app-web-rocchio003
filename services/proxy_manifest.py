@@ -1,5 +1,6 @@
 import asyncio
 import secrets
+import time
 import urllib.parse
 import aiohttp
 import config as _config
@@ -15,7 +16,6 @@ from services.proxy_shared import (
     STRICT_PROXY_CONTEXT,
     ManifestRewriter,
     check_vavoo_request,
-    should_use_short_manifest_urls,
     parse_clearkey_params,
     seal_clearkey,
     MPDToHLSConverter,
@@ -31,6 +31,10 @@ from services.proxy_shared import (
     request_log_context,
     safe_log_route,
 )
+
+
+_LEGACY_REDIRECT_CACHE: dict = {}
+_LEGACY_REDIRECT_TTL = 120.0
 
 
 class HLSProxyManifestHandlerMixin:
@@ -123,7 +127,6 @@ class HLSProxyManifestHandlerMixin:
                         )
 
                     if resp.status != 200:
-                        error_text = await resp.text()
                         logger.error(
                             "❌ Failed to fetch MPD: status=%s [%s]",
                             resp.status,
@@ -308,6 +311,22 @@ class HLSProxyManifestHandlerMixin:
                     header_name = param_name[2:]
                     combined_headers[header_name] = param_value
 
+            cache_key = (
+                target_url,
+                request.query.get("host"),
+                bypass_warp,
+                bypass_proxies,
+                selected_proxy or "",
+                force_direct,
+                request.query.get("api_password") or "",
+                *get_extractor_routing_overrides("dlstreams"),
+            )
+            if request.path == "/proxy/manifest.m3u8" and redirect_stream:
+                cached = _LEGACY_REDIRECT_CACHE.get(cache_key)
+                if cached and time.monotonic() - cached[0] < _LEGACY_REDIRECT_TTL:
+                    logger.info("[PLAY] Reusing resolved DLStreams manifest")
+                    return web.HTTPFound(cached[1])
+
             # DUAL's browser test already resolved the final media URL and its
             # required headers. Do not run GenericHLSExtractor again: providers
             # can reject the Referer it guesses even though the raw URL works.
@@ -345,50 +364,53 @@ class HLSProxyManifestHandlerMixin:
                 extractor = await self.get_extractor(
                     target_url, combined_headers, host=forced_host, bypass_warp=bypass_warp
                 )
-
-                # The first resolver call identifies the extractor. Apply its
-                # admin routing policy before the actual extraction, then use a
-                # routing-specific cached extractor instance.
-                resolved_key = self._extractor_key_for_instance(extractor)
-                if not extractor_key or (resolved_key and not resolved_key.startswith("generic")):
-                    extractor_key = resolved_key or extractor_key
-                admin_warp_off, admin_proxy_off = get_extractor_routing_overrides(extractor_key)
-                routing_changed = False
-                if admin_warp_off and not bypass_warp:
-                    bypass_warp = True
-                    BYPASS_WARP_CONTEXT.set(True)
-                    routing_changed = True
-                if admin_proxy_off and not bypass_proxies:
-                    bypass_proxies = True
-                    BYPASS_PROXIES_CONTEXT.set(True)
-                    routing_changed = True
-                if routing_changed:
-                    selected_proxy = None
-                    SELECTED_PROXY_CONTEXT.set(None)
-                    STRICT_PROXY_CONTEXT.set(False)
-                    extractor = await self.get_extractor(
-                        target_url, combined_headers, host=forced_host, bypass_warp=bypass_warp
-                    )
+                try:
+                    # The first resolver call identifies the extractor. Apply its
+                    # admin routing policy before the actual extraction, then use a
+                    # routing-specific cached extractor instance.
                     resolved_key = self._extractor_key_for_instance(extractor)
                     if not extractor_key or (resolved_key and not resolved_key.startswith("generic")):
                         extractor_key = resolved_key or extractor_key
+                    admin_warp_off, admin_proxy_off = get_extractor_routing_overrides(extractor_key)
+                    routing_changed = False
+                    if admin_warp_off and not bypass_warp:
+                        bypass_warp = True
+                        BYPASS_WARP_CONTEXT.set(True)
+                        routing_changed = True
+                    if admin_proxy_off and not bypass_proxies:
+                        bypass_proxies = True
+                        BYPASS_PROXIES_CONTEXT.set(True)
+                        routing_changed = True
+                    if routing_changed:
+                        selected_proxy = None
+                        SELECTED_PROXY_CONTEXT.set(None)
+                        STRICT_PROXY_CONTEXT.set(False)
+                        self._retire_extractors([extractor])
+                        extractor = await self.get_extractor(
+                            target_url, combined_headers, host=forced_host, bypass_warp=bypass_warp
+                        )
+                        resolved_key = self._extractor_key_for_instance(extractor)
+                        if not extractor_key or (resolved_key and not resolved_key.startswith("generic")):
+                            extractor_key = resolved_key or extractor_key
 
-                # ✅ FIX CRITICO: Forza l'aggiornamento degli header dell'estrattore.
-                # Siccome gli estrattori vengono memorizzati in self.extractors (cache),
-                # se non aggiorniamo request_headers, i segmenti successivi userebbero
-                # gli header del primo manifest caricato, ignorando h_Referer/h_Origin.
-                if extractor:
-                    extractor.request_headers = combined_headers
+                    # ✅ FIX CRITICO: Forza l'aggiornamento degli header dell'estrattore.
+                    # Siccome gli estrattori vengono memorizzati in self.extractors (cache),
+                    # se non aggiorniamo request_headers, i segmenti successivi userebbero
+                    # gli header del primo manifest caricato, ignorando h_Referer/h_Origin.
+                    if extractor:
+                        extractor.request_headers = combined_headers
 
-
-                # Passa il flag force_refresh all'estrattore
-                result = await extractor.extract(
-                    target_url,
-                    force_refresh=force_refresh,
-                    request_headers=combined_headers,
-                    bypass_warp=bypass_warp,
-                    proxy=selected_proxy
-                )
+                    # Passa il flag force_refresh all'estrattore
+                    async with self.hold_extractor(extractor):
+                        result = await extractor.extract(
+                            target_url,
+                            force_refresh=force_refresh,
+                            request_headers=combined_headers,
+                            bypass_warp=bypass_warp,
+                            proxy=selected_proxy
+                        )
+                finally:
+                    self._retire_extractors([extractor])
                 resolved_key = self._extractor_key_for_instance(extractor)
                 if not extractor_key or (resolved_key and not resolved_key.startswith("generic")):
                     extractor_key = resolved_key or extractor_key
@@ -464,6 +486,55 @@ class HLSProxyManifestHandlerMixin:
                         stream_url += "&disable_ssl=1"
                     else:
                         stream_url += "?disable_ssl=1"
+
+                # Legacy /proxy/manifest.m3u8 requests for dlstreams pages must
+                # redirect to the stable HLS proxy URL instead of serving the
+                # playlist and re-extracting on every player reload.
+                if (
+                    request.path == "/proxy/manifest.m3u8"
+                    and redirect_stream
+                    and extractor_key in {"dlstreams", "vavoo"}
+                ):
+                    proxy_base = get_public_base_url(request)
+                    query = {"d": stream_url}
+                    query.update(
+                        {f"h_{key}": value for key, value in stream_headers.items()}
+                    )
+                    api_password = request.query.get("api_password")
+                    if api_password:
+                        query["api_password"] = api_password
+                    if force_disable_ssl or request.query.get("disable_ssl") == "1":
+                        query["disable_ssl"] = "1"
+                    if bypass_warp:
+                        query["warp"] = "off"
+                    if bypass_proxies:
+                        query["proxy"] = "off"
+                    elif selected_proxy:
+                        query["proxy"] = selected_proxy
+                    if force_direct:
+                        query["direct"] = "1"
+                    query["extractor_key"] = extractor_key
+                    if stream_key:
+                        query["stream_key"] = stream_key
+                    query["orig_url"] = (
+                        request.query.get("orig_url")
+                        or request.query.get("url")
+                        or request.query.get("d", "")
+                    )
+                    full_proxy_url = (
+                        f"{proxy_base}/proxy/hls/manifest.m3u8?{urllib.parse.urlencode(query)}"
+                    )
+                    if extractor_key == "dlstreams":
+                        now = time.monotonic()
+                        for key, (ts, _) in list(_LEGACY_REDIRECT_CACHE.items()):
+                            if now - ts >= _LEGACY_REDIRECT_TTL:
+                                _LEGACY_REDIRECT_CACHE.pop(key, None)
+                        _LEGACY_REDIRECT_CACHE[cache_key] = (now, full_proxy_url)
+                    logger.info(
+                        "[PLAY] Redirecting %s legacy manifest to the stable proxy URL",
+                        extractor_key,
+                    )
+                    return web.HTTPFound(full_proxy_url)
 
 
             # --- DASH NATIVO: Riscrive il manifest per segmenti proxati (senza conversione) ---
@@ -601,7 +672,6 @@ class HLSProxyManifestHandlerMixin:
                     stream_headers=stream_headers,
                     original_channel_url=original_channel_url,
                     api_password=api_password,
-                    get_extractor_func=lambda url, headers, host=None: self.get_extractor(url, headers, host, bypass_warp=bypass_warp),
                     no_bypass=no_bypass,
                     shorten_url_func=self.shorten_hls_url,
                     bypass_warp=bypass_warp,
@@ -827,19 +897,16 @@ class HLSProxyManifestHandlerMixin:
                 logger.warning("Proxy died during playlist fetch, re-extracting %s (orig URL: %s)", target_url, extraction_url)
                 extractor2 = None
                 try:
-                    extractor2 = await self.get_extractor(
+                    async with self.borrow_extractor(
                         extraction_url, combined_headers,
                         host=request.query.get("host"), bypass_warp=bypass_warp
-                    )
-                    if not extractor2:
-                        logger.warning("No extractor found for %s during re-extraction", extraction_url)
-                        return web.Response(text="Re-extraction failed: no extractor found", status=502)
-                    extractor2.request_headers = combined_headers
-                    result2 = await extractor2.extract(
-                        extraction_url, force_refresh=True,
-                        request_headers=combined_headers, bypass_warp=bypass_warp,
-                        proxy=None,
-                    )
+                    ) as extractor2:
+                        extractor2.request_headers = combined_headers
+                        result2 = await extractor2.extract(
+                            extraction_url, force_refresh=True,
+                            request_headers=combined_headers, bypass_warp=bypass_warp,
+                            proxy=None,
+                        )
                     stream_url2 = result2["destination_url"]
                     stream_headers2 = result2.get("request_headers", {})
                     selected_proxy2 = result2.get("selected_proxy")

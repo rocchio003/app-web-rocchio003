@@ -7,8 +7,6 @@ from services.proxy_shared import (
     BYPASS_PROXIES_CONTEXT,
     SELECTED_PROXY_CONTEXT,
     STRICT_PROXY_CONTEXT,
-    check_vavoo_request,
-    ManifestRewriter,
     get_public_base_url,
     get_extractor_routing_overrides,
     request_log_context,
@@ -17,8 +15,6 @@ from services.proxy_shared import (
 import config_store
 import asyncio
 import base64
-import gzip
-import re
 import urllib.parse
 import config as _config
 from yarl import URL
@@ -150,6 +146,7 @@ class HLSProxyExtractorHandlerMixin:
                     ],
                     "examples": [
                         f"{get_public_base_url(request)}/extractor/video?d=https://vavoo.to/channel/123",
+                        f"{get_public_base_url(request)}/extractor/video?d=https://kool.to/kool-iptv/play/abc123",
                         f"{get_public_base_url(request)}/extractor/video.m3u8?host=vavoo&d=https://custom-link.com",
                         f"{get_public_base_url(request)}/extractor/video.mp4?host=mixdrop&d=https://mixdrop.co/e/ABC123XYZ",
                         f"{get_public_base_url(request)}/extractor/video?host=fctv33&d=https://fctv33.stream/match/123/stream/456",
@@ -203,34 +200,39 @@ class HLSProxyExtractorHandlerMixin:
             extractor = await self.get_extractor(
                 url, dict(request.headers), host=host_param, bypass_warp=bypass_warp
             )
+            try:
+                # Check if this extractor should bypass WARP or proxies based on admin config
+                extractor_key = self._extractor_key_for_instance(extractor)
+                if extractor_key:
+                    base_key = extractor_key.replace("_direct", "").replace("_noproxy", "")
 
-            # Check if this extractor should bypass WARP or proxies based on admin config
-            extractor_key = self._extractor_key_for_instance(extractor)
-            if extractor_key:
-                base_key = extractor_key.replace("_direct", "").replace("_noproxy", "")
-                
-                # Check WARP-off extractor policy.
-                warp_off_list = config_store.get("warp_off_extractors", [])
-                if base_key in warp_off_list:
-                    bypass_warp = True
-                    BYPASS_WARP_CONTEXT.set(True)
-                    logger.debug(f"WARP off for extractor: {base_key}")
-                    
-                # Check proxy off
-                proxy_off_list = config_store.get("proxy_off_extractors", [])
-                if base_key in proxy_off_list:
-                    BYPASS_PROXIES_CONTEXT.set(True)
-                    logger.debug(f"Proxy off for extractor: {base_key}")
-                    
-                if base_key in warp_off_list or base_key in proxy_off_list:
-                    extractor = await self.get_extractor(
-                        url, dict(request.headers), host=host_param, bypass_warp=bypass_warp
+                    # Check WARP-off extractor policy.
+                    warp_off_list = config_store.get("warp_off_extractors", [])
+                    if base_key in warp_off_list:
+                        bypass_warp = True
+                        BYPASS_WARP_CONTEXT.set(True)
+                        logger.debug(f"WARP off for extractor: {base_key}")
+
+                    # Check proxy off
+                    proxy_off_list = config_store.get("proxy_off_extractors", [])
+                    if base_key in proxy_off_list:
+                        BYPASS_PROXIES_CONTEXT.set(True)
+                        logger.debug(f"Proxy off for extractor: {base_key}")
+
+                    if base_key in warp_off_list or base_key in proxy_off_list:
+                        self._retire_extractors([extractor])
+                        extractor = await self.get_extractor(
+                            url, dict(request.headers), host=host_param, bypass_warp=bypass_warp
+                        )
+
+                extractor_timeout = getattr(extractor, "REQUEST_TIMEOUT_TOTAL", 30)
+                async with self.hold_extractor(extractor):
+                    result = await asyncio.wait_for(
+                        extractor.extract(url, **extractor_kwargs),
+                        timeout=extractor_timeout,
                     )
-
-            extractor_timeout = getattr(extractor, "REQUEST_TIMEOUT_TOTAL", 30)
-            result = await asyncio.wait_for(
-                extractor.extract(url, **extractor_kwargs), timeout=extractor_timeout
-            )
+            finally:
+                self._retire_extractors([extractor])
             result_query_params = _protected_extractor_params(result)
             extractor_key = getattr(extractor, "extractor_name", None) or self._extractor_key_for_instance(extractor)
             if extractor_key:
@@ -247,7 +249,6 @@ class HLSProxyExtractorHandlerMixin:
             stream_url = result["destination_url"]
             stream_headers = result.get("request_headers", {})
             mediaflow_endpoint = result.get("mediaflow_endpoint", "hls_proxy")
-            captured_manifest = result.get("captured_manifest")
             force_disable_ssl = result.get("disable_ssl", False)
             selected_proxy = result.get("selected_proxy") or selected_proxy
             if not selected_proxy and extractor:
@@ -332,7 +333,9 @@ class HLSProxyExtractorHandlerMixin:
             path_lower = urllib.parse.urlparse(stream_url).path.lower()
             is_direct_video = any(path_lower.endswith(ext) for ext in [".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv"])
 
-            if mediaflow_endpoint == "proxy_stream_endpoint" or is_direct_video:
+            if path_lower.endswith(".m3u8"):
+                endpoint = "/proxy/hls/manifest.m3u8"
+            elif mediaflow_endpoint == "proxy_stream_endpoint" or is_direct_video:
                 endpoint = "/proxy/stream"
             elif (
                 mediaflow_endpoint == "mpd_manifest_proxy"
@@ -385,51 +388,22 @@ class HLSProxyExtractorHandlerMixin:
                     f"{urllib.parse.quote(value, safe='')}"
                 )
 
-            if redirect_stream and captured_manifest and endpoint == "/proxy/hls/manifest.m3u8":
-                original_channel_url = request.query.get("orig_url") or request.query.get("url") or request.query.get("d", "")
-                no_bypass = request.query.get("no_bypass") == "1"
-                is_vavoo_req = check_vavoo_request(stream_headers, request, stream_url)
-                disable_ssl = request.query.get("disable_ssl") == "1" or force_disable_ssl or is_vavoo_req
+            # 1. URL COMPLETO (Solo per il redirect)
+            full_proxy_url = f"{proxy_base}{endpoint}?d={encoded_url}{header_params}"
 
-                # Variant selection (all variants or only the highest one)
-                # happens in rewrite_manifest_urls via max_res.
-                manifest_content = captured_manifest
-                manifest_base_url = stream_url
+            # Carry over redirect_stream param for nested redirects
+            if redirect_stream:
+                full_proxy_url += "&redirect_stream=true"
 
-                rewritten_manifest = await ManifestRewriter.rewrite_manifest_urls(
-                    manifest_content=manifest_content,
-                    base_url=manifest_base_url,
-                    proxy_base=proxy_base,
-                    stream_headers=stream_headers,
-                    original_channel_url=original_channel_url,
-                    api_password=api_password,
-                    get_extractor_func=lambda url, headers, host=None: self.get_extractor(
-                        url, headers, host, bypass_warp=bypass_warp
-                    ),
-                    no_bypass=no_bypass,
-                    shorten_url_func=self.shorten_hls_url,
-                    bypass_warp=bypass_warp,
-                    bypass_proxies=bypass_proxies,
-                    disable_ssl=disable_ssl,
-                    selected_proxy=selected_proxy,
-                    force_direct=force_direct,
-                    extractor_key=extractor_key,
-                    stream_key=stream_key,
-                    max_res=forced_max_res,
+            # Always send HLS playback to the stable proxy manifest instead of
+            # serving the playlist from this endpoint. This keeps reloads off
+            # the extractor (and avoids re-resolving signed provider URLs).
+            if redirect_stream and endpoint == "/proxy/hls/manifest.m3u8":
+                logger.info(
+                    "[PLAY] Redirecting %s manifest to the stable proxy URL",
+                    extractor_key or "HLS",
                 )
-                response_headers = {
-                    "Content-Type": "application/vnd.apple.mpegurl",
-                    "Access-Control-Allow-Origin": "*",
-                    "Cache-Control": "no-cache",
-                }
-                if "gzip" in request.headers.get("Accept-Encoding", "").lower():
-                    response_headers["Content-Encoding"] = "gzip"
-                    response_headers["Vary"] = "Accept-Encoding"
-                    return web.Response(
-                        body=gzip.compress(rewritten_manifest.encode("utf-8"), mtime=0),
-                        headers=response_headers,
-                    )
-                return web.Response(text=rewritten_manifest, headers=response_headers)
+                return web.HTTPFound(full_proxy_url)
 
             if redirect_stream and endpoint == "/proxy/mpd/manifest.m3u8":
                 proxy_query = {
@@ -462,13 +436,6 @@ class HLSProxyExtractorHandlerMixin:
                     rel_url=URL(endpoint).with_query(proxy_query)
                 )
                 return await self.handle_proxy_request(proxy_request)
-
-            # 1. URL COMPLETO (Solo per il redirect)
-            full_proxy_url = f"{proxy_base}{endpoint}?d={encoded_url}{header_params}"
-
-            # Carry over redirect_stream param for nested redirects
-            if redirect_stream:
-                full_proxy_url += "&redirect_stream=true"
 
             if redirect_stream:
                 logger.info("[PLAY] Proxying stream directly without redirect")

@@ -3,7 +3,9 @@ import asyncio
 import os
 from services.proxy_core import HLSProxyCoreMixin
 from services.proxy_dash import HLSProxyDashMixin
-from services.proxy_handlers import HLSProxyHandlersMixin
+from services.proxy_extractor import HLSProxyExtractorHandlerMixin
+from services.proxy_license import HLSProxyLicenseHandlerMixin
+from services.proxy_manifest import HLSProxyManifestHandlerMixin
 from services.proxy_pages import HLSProxyPagesMixin
 from services.proxy_streaming import HLSProxyStreamingMixin
 from services.proxy_dual import HLSProxyDualMixin
@@ -11,7 +13,9 @@ from services.proxy_dual import HLSProxyDualMixin
 class HLSProxy(
     HLSProxyDualMixin,
     HLSProxyCoreMixin,
-    HLSProxyHandlersMixin,
+    HLSProxyManifestHandlerMixin,
+    HLSProxyExtractorHandlerMixin,
+    HLSProxyLicenseHandlerMixin,
     HLSProxyDashMixin,
     HLSProxyStreamingMixin,
     HLSProxyPagesMixin,
@@ -22,7 +26,6 @@ class HLSProxy(
         # Shared extractors registry owned by the proxy instance
         self.extractors = {}
         self._extractor_atimes = {}
-        self._extractor_stream_atimes = {}
         self._retired_extractors = []
         self._retired_extractor_atimes = {}
 
@@ -61,8 +64,9 @@ class HLSProxy(
         # stream_key -> (old_base_dir, new_base_dir, new_query_string_with_leading_question_mark)
         self._renewed_cdn_tokens: dict[str, tuple[str, str, str]] = {}
         self._renewed_cdn_token_atimes: dict[str, float] = {}
-        # Template cache (read once, serve many)
+        # Template/OpenAPI cache (read once, serve many)
         self._template_cache = {}
+        self._openapi_text = None
         self._template_cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "templates")
 
         # Version information
